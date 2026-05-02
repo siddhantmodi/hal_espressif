@@ -59,10 +59,106 @@ extern void intr_matrix_route(int intr_src, int intr_num);
 #define TAG "esp_adapter"
 
 static void esp_wifi_free(void *mem);
+static void wifi_task_cleanup(struct k_work *work);
 
-static void *wifi_msgq_buffer;
+#ifndef CONFIG_ESP32_WIFI_ADAPTER_TASK_COUNT
+#define CONFIG_ESP32_WIFI_ADAPTER_TASK_COUNT 2
+#endif
 
-static struct k_thread wifi_task_handle;
+#define WIFI_ADAPTER_TASK_SLOT_COUNT CONFIG_ESP32_WIFI_ADAPTER_TASK_COUNT
+
+struct wifi_adapter_msgq {
+	struct k_msgq msgq;
+	void *buffer;
+};
+
+static struct k_thread wifi_task_handles[WIFI_ADAPTER_TASK_SLOT_COUNT];
+static k_thread_stack_t *wifi_task_stacks[WIFI_ADAPTER_TASK_SLOT_COUNT];
+static bool wifi_task_slots_used[WIFI_ADAPTER_TASK_SLOT_COUNT];
+static bool wifi_task_cleanup_pending[WIFI_ADAPTER_TASK_SLOT_COUNT];
+static K_MUTEX_DEFINE(wifi_task_slots_lock);
+static K_WORK_DELAYABLE_DEFINE(wifi_task_cleanup_work, wifi_task_cleanup);
+
+static int wifi_task_slot_alloc(void)
+{
+	int slot = -1;
+
+	k_mutex_lock(&wifi_task_slots_lock, K_FOREVER);
+	for (int i = 0; i < WIFI_ADAPTER_TASK_SLOT_COUNT; i++) {
+		if (!wifi_task_slots_used[i]) {
+			wifi_task_slots_used[i] = true;
+			slot = i;
+			break;
+		}
+	}
+	k_mutex_unlock(&wifi_task_slots_lock);
+
+	return slot;
+}
+
+static int wifi_task_slot_find(k_tid_t tid)
+{
+	int slot = -1;
+
+	k_mutex_lock(&wifi_task_slots_lock, K_FOREVER);
+	for (int i = 0; i < WIFI_ADAPTER_TASK_SLOT_COUNT; i++) {
+		if (tid == &wifi_task_handles[i]) {
+			slot = i;
+			break;
+		}
+	}
+	k_mutex_unlock(&wifi_task_slots_lock);
+
+	return slot;
+}
+
+static void wifi_task_slot_free(int slot)
+{
+	k_mutex_lock(&wifi_task_slots_lock, K_FOREVER);
+	wifi_task_cleanup_pending[slot] = false;
+	wifi_task_slots_used[slot] = false;
+	k_mutex_unlock(&wifi_task_slots_lock);
+}
+
+static void wifi_task_cleanup(struct k_work *work)
+{
+	bool reschedule = false;
+
+	ARG_UNUSED(work);
+
+	for (int i = 0; i < WIFI_ADAPTER_TASK_SLOT_COUNT; i++) {
+		k_thread_stack_t *stack;
+		int ret;
+
+		k_mutex_lock(&wifi_task_slots_lock, K_FOREVER);
+		if (!wifi_task_cleanup_pending[i] || wifi_task_stacks[i] == NULL) {
+			k_mutex_unlock(&wifi_task_slots_lock);
+			continue;
+		}
+		stack = wifi_task_stacks[i];
+		k_mutex_unlock(&wifi_task_slots_lock);
+
+		ret = k_thread_stack_free(stack);
+		if (ret == 0) {
+			k_mutex_lock(&wifi_task_slots_lock, K_FOREVER);
+			if (wifi_task_stacks[i] == stack) {
+				wifi_task_stacks[i] = NULL;
+				wifi_task_cleanup_pending[i] = false;
+				wifi_task_slots_used[i] = false;
+			}
+			k_mutex_unlock(&wifi_task_slots_lock);
+		} else if (ret == -EBUSY) {
+			reschedule = true;
+		} else {
+			LOG_ERR("failed to free Wi-Fi task stack %d (%d)", i, ret);
+			reschedule = true;
+		}
+	}
+
+	if (reschedule) {
+		(void)k_work_reschedule(&wifi_task_cleanup_work, K_MSEC(100));
+	}
+}
 
 IRAM_ATTR void *wifi_malloc(size_t size)
 {
@@ -115,20 +211,22 @@ wifi_static_queue_t *wifi_create_queue(int queue_len, int item_size)
         return NULL;
     }
 
-    wifi_msgq_buffer = wifi_malloc(queue_len * item_size);
-    if (wifi_msgq_buffer == NULL) {
+    queue->storage = wifi_malloc(queue_len * item_size);
+    if (queue->storage == NULL) {
         LOG_ERR("msg buffer allocation failed");
+        esp_wifi_free(queue);
         return NULL;
     }
 
     queue->handle = wifi_malloc(sizeof(struct k_msgq));
     if (queue->handle == NULL) {
-        esp_wifi_free(wifi_msgq_buffer);
+        esp_wifi_free(queue->storage);
+        esp_wifi_free(queue);
         LOG_ERR("queue handle allocation failed");
         return NULL;
     }
 
-    k_msgq_init((struct k_msgq *)queue->handle, wifi_msgq_buffer, item_size, queue_len);
+    k_msgq_init((struct k_msgq *)queue->handle, queue->storage, item_size, queue_len);
 
     return queue;
 }
@@ -137,6 +235,7 @@ void wifi_delete_queue(wifi_static_queue_t *queue)
 {
     if (queue) {
         esp_wifi_free(queue->handle);
+        esp_wifi_free(queue->storage);
         esp_wifi_free(queue);
     }
 }
@@ -256,14 +355,21 @@ static int32_t IRAM_ATTR mutex_unlock_wrapper(void *mutex)
 
 static void *queue_create_wrapper(uint32_t queue_len, uint32_t item_size)
 {
-    struct k_queue *queue = (struct k_queue *)wifi_malloc(sizeof(struct k_queue));
+    struct wifi_adapter_msgq *queue = wifi_malloc(sizeof(*queue));
 
     if (queue == NULL) {
         LOG_ERR("queue malloc failed");
         return NULL;
     }
 
-    k_msgq_init((struct k_msgq *)queue, wifi_msgq_buffer, item_size, queue_len);
+    queue->buffer = wifi_malloc(queue_len * item_size);
+    if (queue->buffer == NULL) {
+        LOG_ERR("queue buffer malloc failed");
+        esp_wifi_free(queue);
+        return NULL;
+    }
+
+    k_msgq_init(&queue->msgq, queue->buffer, item_size, queue_len);
 
     return (void *)queue;
 }
@@ -271,57 +377,61 @@ static void *queue_create_wrapper(uint32_t queue_len, uint32_t item_size)
 static void queue_delete_wrapper(void *handle)
 {
     if (handle != NULL) {
-        esp_wifi_free(handle);
+        struct wifi_adapter_msgq *queue = handle;
+
+        esp_wifi_free(queue->buffer);
+        esp_wifi_free(queue);
     }
 }
 
 static int32_t queue_send_wrapper(void *queue, void *item, uint32_t block_time_tick)
 {
+    int ret;
+
     if (block_time_tick == OSI_FUNCS_TIME_BLOCKING) {
-        k_msgq_put((struct k_msgq *)queue, item, K_FOREVER);
+        ret = k_msgq_put((struct k_msgq *)queue, item, K_FOREVER);
     } else {
-        k_msgq_put((struct k_msgq *)queue, item, K_TICKS(block_time_tick));
+        ret = k_msgq_put((struct k_msgq *)queue, item, K_TICKS(block_time_tick));
     }
-    return 1;
+
+    return ret == 0 ? 1 : 0;
 }
 
 static int32_t IRAM_ATTR queue_send_from_isr_wrapper(void *queue, void *item, void *hptw)
 {
     int *hpt = (int *)hptw;
+    int ret;
 
-    k_msgq_put((struct k_msgq *)queue, item, K_NO_WAIT);
+    ret = k_msgq_put((struct k_msgq *)queue, item, K_NO_WAIT);
     if (hpt) {
         *hpt = 0;
     }
-    return 1;
+    return ret == 0 ? 1 : 0;
 }
 
 static int32_t queue_send_to_back_wrapper(void *queue, void *item, uint32_t block_time_tick)
 {
-    ARG_UNUSED(queue);
-    ARG_UNUSED(item);
-    ARG_UNUSED(block_time_tick);
-
-    return 0;
+    return queue_send_wrapper(queue, item, block_time_tick);
 }
 
 static int32_t queue_send_to_front_wrapper(void *queue, void *item, uint32_t block_time_tick)
 {
-    ARG_UNUSED(queue);
-    ARG_UNUSED(item);
     ARG_UNUSED(block_time_tick);
 
-    return 0;
+    return k_msgq_put_front((struct k_msgq *)queue, item) == 0 ? 1 : 0;
 }
 
 static int32_t queue_recv_wrapper(void *queue, void *item, uint32_t block_time_tick)
 {
+    int ret;
+
     if (block_time_tick == OSI_FUNCS_TIME_BLOCKING) {
-        k_msgq_get((struct k_msgq *)queue, item, K_FOREVER);
+        ret = k_msgq_get((struct k_msgq *)queue, item, K_FOREVER);
     } else {
-        k_msgq_get((struct k_msgq *)queue, item, K_MSEC(block_time_tick));
+        ret = k_msgq_get((struct k_msgq *)queue, item, K_TICKS(block_time_tick));
     }
-    return 1;
+
+    return ret == 0 ? 1 : 0;
 }
 
 static uint32_t event_group_wait_bits_wrapper(void *event, uint32_t bits_to_wait_for, int clear_on_exit, int wait_for_all_bits, uint32_t block_time_tick)
@@ -339,41 +449,81 @@ static int32_t task_create_pinned_to_core_wrapper(void *task_func, const char *n
 {
     ARG_UNUSED(core_id);
 
+    int slot = wifi_task_slot_alloc();
+    if (slot < 0) {
+        LOG_ERR("no Wi-Fi adapter task slots available for %s", name);
+        return 0;
+    }
+
     k_thread_stack_t *wifi_stack = k_thread_stack_alloc(stack_depth,
                                     IS_ENABLED(CONFIG_USERSPACE) ? K_USER : 0);
+    if (wifi_stack == NULL) {
+        LOG_ERR("failed to allocate stack for Wi-Fi task %s (%u bytes)", name, stack_depth);
+        wifi_task_slot_free(slot);
+        return 0;
+    }
 
-    k_tid_t tid = k_thread_create(&wifi_task_handle, wifi_stack, stack_depth,
+    wifi_task_stacks[slot] = wifi_stack;
+    wifi_task_cleanup_pending[slot] = false;
+
+    k_tid_t tid = k_thread_create(&wifi_task_handles[slot], wifi_stack, stack_depth,
                       (k_thread_entry_t)task_func, param, NULL, NULL,
                       prio, K_INHERIT_PERMS, K_NO_WAIT);
 
     k_thread_name_set(tid, name);
 
-    *(int32_t *)task_handle = (int32_t)tid;
+    if (task_handle != NULL) {
+        *(void **)task_handle = tid;
+    }
     return 1;
 }
 
 static int32_t task_create_wrapper(void *task_func, const char *name, uint32_t stack_depth, void *param, uint32_t prio, void *task_handle)
 {
+    int slot = wifi_task_slot_alloc();
+    if (slot < 0) {
+        LOG_ERR("no Wi-Fi adapter task slots available for %s", name);
+        return 0;
+    }
+
     k_thread_stack_t *wifi_stack = k_thread_stack_alloc(stack_depth,
                                     IS_ENABLED(CONFIG_USERSPACE) ? K_USER : 0);
+    if (wifi_stack == NULL) {
+        LOG_ERR("failed to allocate stack for Wi-Fi task %s (%u bytes)", name, stack_depth);
+        wifi_task_slot_free(slot);
+        return 0;
+    }
 
-    k_tid_t tid = k_thread_create(&wifi_task_handle, wifi_stack, stack_depth,
+    wifi_task_stacks[slot] = wifi_stack;
+    wifi_task_cleanup_pending[slot] = false;
+
+    k_tid_t tid = k_thread_create(&wifi_task_handles[slot], wifi_stack, stack_depth,
                       (k_thread_entry_t)task_func, param, NULL, NULL,
                       prio, K_INHERIT_PERMS, K_NO_WAIT);
 
     k_thread_name_set(tid, name);
 
-    *(int32_t *)task_handle = (int32_t)tid;
+    if (task_handle != NULL) {
+        *(void **)task_handle = tid;
+    }
     return 1;
 }
 
 static void task_delete_wrapper(void *handle)
 {
-    if (handle != NULL) {
-        k_thread_abort((k_tid_t)handle);
-    }
+    k_tid_t tid = handle != NULL ? (k_tid_t)handle : k_current_get();
+    int slot = wifi_task_slot_find(tid);
 
-    k_object_release(&wifi_task_handle);
+    if (slot >= 0) {
+        k_mutex_lock(&wifi_task_slots_lock, K_FOREVER);
+        wifi_task_cleanup_pending[slot] = true;
+        k_mutex_unlock(&wifi_task_slots_lock);
+        (void)k_work_reschedule(&wifi_task_cleanup_work, K_MSEC(10));
+
+        k_thread_abort(tid);
+    } else {
+        k_thread_abort(tid);
+    }
 }
 
 static void task_delay_wrapper(uint32_t ticks)
@@ -459,9 +609,7 @@ static void *IRAM_ATTR zalloc_internal_wrapper(size_t size)
 
 uint32_t uxQueueMessagesWaiting(void *queue)
 {
-    ARG_UNUSED(queue);
-
-    return 0;
+    return k_msgq_num_used_get((struct k_msgq *)queue);
 }
 
 void *xEventGroupCreate(void)
