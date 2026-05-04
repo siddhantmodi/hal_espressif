@@ -2594,7 +2594,7 @@
  *            on it, and considering stronger message digests instead.
  *
  */
-#if CONFIG_MBEDTLS_SHA1_C
+#if defined(CONFIG_MBEDTLS_SHA1_C) || defined(CONFIG_PSA_WANT_ALG_SHA_1)
 #define PSA_WANT_ALG_SHA_1 1
 #else
 #undef PSA_WANT_ALG_SHA_1
@@ -2632,7 +2632,7 @@
  *
  * This module adds support for SHA-384 and SHA-512.
  */
-#ifdef CONFIG_MBEDTLS_SHA512_C
+#if defined(CONFIG_MBEDTLS_SHA512_C) || defined(CONFIG_PSA_WANT_ALG_SHA_512)
 #define PSA_WANT_ALG_SHA_512 1
 #else
 #undef PSA_WANT_ALG_SHA_512
@@ -2652,7 +2652,7 @@
  *
  * Comment to disable SHA-384
  */
-#ifdef CONFIG_MBEDTLS_SHA384_C
+#if defined(CONFIG_MBEDTLS_SHA384_C) || defined(CONFIG_PSA_WANT_ALG_SHA_384)
 #define PSA_WANT_ALG_SHA_384 1
 #else
 #undef PSA_WANT_ALG_SHA_384
@@ -2675,10 +2675,18 @@
  */
 #ifdef CONFIG_MBEDTLS_SHA256_C
 #define MBEDTLS_SHA256_C
+#endif
+
+#if defined(CONFIG_MBEDTLS_SHA256_C) || defined(CONFIG_PSA_WANT_ALG_SHA_256)
 #define PSA_WANT_ALG_SHA_256 1
-#define PSA_WANT_ALG_SHA_224 1
 #else
 #undef PSA_WANT_ALG_SHA_256
+#endif
+
+#if defined(CONFIG_MBEDTLS_SHA224_C) || defined(CONFIG_MBEDTLS_SHA256_C) || \
+    defined(CONFIG_PSA_WANT_ALG_SHA_224)
+#define PSA_WANT_ALG_SHA_224 1
+#else
 #undef PSA_WANT_ALG_SHA_224
 #endif
 
