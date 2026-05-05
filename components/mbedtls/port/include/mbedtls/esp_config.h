@@ -200,7 +200,7 @@
 #undef MBEDTLS_SHA224_C
 #define ESP_HMAC_TRANSPARENT_DRIVER_ENABLED
 #define MBEDTLS_PSA_ACCEL_ALG_HMAC
-#define MBEDTLS_PSA_BUILTIN_ALG_HMAC
+#define MBEDTLS_PSA_BUILTIN_ALG_HMAC 1
 #if SOC_SHA_SUPPORT_SHA512
 #define MBEDTLS_PSA_ACCEL_ALG_SHA_384
 #undef MBEDTLS_PSA_BUILTIN_ALG_SHA_384
@@ -228,7 +228,7 @@
 #else
 #if !defined(MBEDTLS_PSA_BUILTIN_ALG_HMAC)
     /* If ROM MD5 is not enabled, use the builtin HMAC algorithm for HMAC(MD5) operations */
-    #define MBEDTLS_PSA_BUILTIN_ALG_HMAC
+    #define MBEDTLS_PSA_BUILTIN_ALG_HMAC 1
 #endif
 #endif /* MBEDTLS_PSA_BUILTIN_ALG_HMAC */
 
@@ -2722,7 +2722,7 @@
 #define PSA_WANT_ALG_SHA3_512 1
 #if !defined(MBEDTLS_PSA_BUILTIN_ALG_HMAC)
     /* If SHA3 is enabled, use the builtin HMAC algorithm for HMAC(SHA3) operations */
-    #define MBEDTLS_PSA_BUILTIN_ALG_HMAC
+    #define MBEDTLS_PSA_BUILTIN_ALG_HMAC 1
 #endif /* MBEDTLS_PSA_BUILTIN_ALG_HMAC */
 #else
 #undef PSA_WANT_ALG_SHA3_224
