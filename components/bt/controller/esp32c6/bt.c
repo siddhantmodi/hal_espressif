@@ -38,6 +38,10 @@
 #include "esp_intr_alloc.h"
 #include "esp_sleep.h"
 #include "esp_pm.h"
+#ifdef CONFIG_PM
+#include <zephyr/pm/policy.h>
+#include "esp_private/critical_section.h"
+#endif
 #ifdef CONFIG_ESP_PHY_ENABLED
 #include "esp_phy_init.h"
 #endif
@@ -491,9 +495,34 @@ void __wrap_esp_panic_handler (void *info)
 
 /* This variable tells if BLE is running */
 static bool s_ble_active = false;
-#ifdef CONFIG_PM_ENABLE
-static DRAM_ATTR esp_pm_lock_handle_t s_pm_lock = NULL;
-#endif // CONFIG_PM_ENABLE
+#ifdef CONFIG_PM
+/*
+ * Zephyr does not implement the esp_pm lock framework (pm_impl_zephyr.c is
+ * stubs), so the BLE controller coordinates with Zephyr system light sleep the
+ * same way the WiFi path does (see esp_wifi/src/wifi_init.c): a refcounted
+ * pm_policy state lock that blocks light sleep while the radio must stay up.
+ */
+DEFINE_CRIT_SECTION_LOCK_STATIC(s_ble_pm_lock);
+static uint32_t s_ble_pm_lock_refcnt;
+
+static void bt_pm_policy_state_lock_get(void)
+{
+    esp_os_enter_critical(&s_ble_pm_lock);
+    if (s_ble_pm_lock_refcnt++ == 0) {
+        pm_policy_state_all_lock_get();
+    }
+    esp_os_exit_critical(&s_ble_pm_lock);
+}
+
+static void bt_pm_policy_state_lock_put(void)
+{
+    esp_os_enter_critical(&s_ble_pm_lock);
+    if (s_ble_pm_lock_refcnt > 0 && --s_ble_pm_lock_refcnt == 0) {
+        pm_policy_state_all_lock_put();
+    }
+    esp_os_exit_critical(&s_ble_pm_lock);
+}
+#endif // CONFIG_PM
 #define MAIN_XTAL_FREQ_HZ                 (40000000)
 #define MAIN_XTAL_FREQ_HZ_WORKROUND       (500000)
 static DRAM_ATTR modem_clock_lpclk_src_t s_bt_lpclk_src = MODEM_CLOCK_LPCLK_SRC_INVALID;
@@ -750,9 +779,9 @@ IRAM_ATTR void controller_sleep_cb(uint32_t enable_tick, void *arg)
     r_ble_rtc_wake_up_state_clr();
 #endif /* CONFIG_FREERTOS_USE_TICKLESS_IDLE */
     esp_phy_disable(PHY_MODEM_BT);
-#ifdef CONFIG_PM_ENABLE
-    esp_pm_lock_release(s_pm_lock);
-#endif // CONFIG_PM_ENABLE
+#ifdef CONFIG_PM
+    bt_pm_policy_state_lock_put();
+#endif // CONFIG_PM
     s_ble_active = false;
 }
 
@@ -762,13 +791,10 @@ IRAM_ATTR void controller_wakeup_cb(void *arg)
     if (s_ble_active) {
         return;
     }
-#ifdef CONFIG_PM_ENABLE
-    esp_pm_config_t pm_config;
-    esp_pm_lock_acquire(s_pm_lock);
-    esp_pm_get_configuration(&pm_config);
-    assert(esp_rom_get_cpu_ticks_per_us() == pm_config.max_freq_mhz);
+#ifdef CONFIG_PM
+    bt_pm_policy_state_lock_get();
     r_ble_rtc_wake_up_state_clr();
-#endif //CONFIG_PM_ENABLE
+#endif // CONFIG_PM
     params = (bt_wakeup_params_t *)arg;
     esp_phy_enable(PHY_MODEM_BT);
     if (s_bt_lpclk_src == MODEM_CLOCK_LPCLK_SRC_RC_SLOW) {
@@ -868,12 +894,10 @@ esp_err_t controller_sleep_init(void)
 #endif /* FREERTOS_USE_TICKLESS_IDLE */
 #endif // CONFIG_ESP32_BT_LE_SLEEP_ENABLE
 
-#ifdef CONFIG_PM_ENABLE
-    rc = esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "bt", &s_pm_lock);
-    if (rc != ESP_OK) {
-        goto error;
-    }
-#endif // CONFIG_PM_ENABLE
+    /*
+     * No esp_pm lock to create under Zephyr: the pm_policy lock is statically
+     * defined (s_ble_pm_lock) and taken/released via the helpers above.
+     */
 #if CONFIG_ESP32_BT_LE_SLEEP_ENABLE && CONFIG_FREERTOS_USE_TICKLESS_IDLE
 #if SOC_PM_RETENTION_HAS_CLOCK_BUG && !CONFIG_MAC_BB_PD
 #error "CONFIG_MAC_BB_PD required for BLE light sleep to run properly"
@@ -908,10 +932,8 @@ esp_err_t controller_sleep_init(void)
 #endif /* CONFIG_ESP32_BT_LE_SLEEP_ENABLE && CONFIG_FREERTOS_USE_TICKLESS_IDLE */
     return rc;
 
-#ifdef CONFIG_PM_ENABLE
-error:
-#endif // CONFIG_PM_ENABLE
 #if CONFIG_ESP32_BT_LE_SLEEP_ENABLE && CONFIG_FREERTOS_USE_TICKLESS_IDLE
+error:
     esp_pm_unregister_skip_light_sleep_callback(r_ble_lll_sleep_should_skip_light_sleep_check);
 #if SOC_PM_RETENTION_HAS_CLOCK_BUG && CONFIG_MAC_BB_PD
     sleep_modem_unregister_mac_bb_module_prepare_callback(sleep_modem_mac_bb_power_down_prepare,
@@ -920,13 +942,7 @@ error:
     esp_sleep_disable_bt_wakeup();
     esp_pm_unregister_inform_out_light_sleep_overhead_callback(sleep_modem_light_sleep_overhead_set);
 #endif /* CONFIG_ESP32_BT_LE_SLEEP_ENABLE && CONFIG_FREERTOS_USE_TICKLESS_IDLE */
-#ifdef CONFIG_PM_ENABLE
-    /*lock should release first and then delete*/
-    if (s_pm_lock != NULL) {
-        esp_pm_lock_delete(s_pm_lock);
-        s_pm_lock = NULL;
-    }
-#endif // CONFIG_PM_ENABLE
+    /* No esp_pm lock to delete under Zephyr; the pm_policy lock is static. */
 
     return rc;
 }
@@ -944,11 +960,7 @@ void controller_sleep_deinit(void)
     sleep_modem_ble_mac_modem_state_deinit();
     esp_pm_unregister_inform_out_light_sleep_overhead_callback(sleep_modem_light_sleep_overhead_set);
 #endif /* CONFIG_ESP32_BT_LE_SLEEP_ENABLE && CONFIG_FREERTOS_USE_TICKLESS_IDLE */
-#ifdef CONFIG_PM_ENABLE
-    /* lock should be released first */
-    esp_pm_lock_delete(s_pm_lock);
-    s_pm_lock = NULL;
-#endif //CONFIG_PM_ENABLE
+    /* No esp_pm lock to delete under Zephyr; the pm_policy lock is static. */
 }
 
 typedef enum {
@@ -1288,9 +1300,9 @@ esp_err_t esp_bt_controller_enable(esp_bt_mode_t mode)
         return ESP_FAIL;
     }
     if (!s_ble_active) {
-#ifdef CONFIG_PM_ENABLE
-        esp_pm_lock_acquire(s_pm_lock);
-#endif  // CONFIG_PM_ENABLE
+#ifdef CONFIG_PM
+        bt_pm_policy_state_lock_get();
+#endif  // CONFIG_PM
         esp_phy_enable(PHY_MODEM_BT);
         s_ble_active = true;
     }
@@ -1323,9 +1335,9 @@ error:
     esp_btbb_disable();
     if (s_ble_active) {
         esp_phy_disable(PHY_MODEM_BT);
-#ifdef CONFIG_PM_ENABLE
-        esp_pm_lock_release(s_pm_lock);
-#endif  // CONFIG_PM_ENABLE
+#ifdef CONFIG_PM
+        bt_pm_policy_state_lock_put();
+#endif  // CONFIG_PM
         s_ble_active = false;
     }
     return ret;
@@ -1347,9 +1359,9 @@ esp_err_t esp_bt_controller_disable(void)
     esp_btbb_disable();
     if (s_ble_active) {
         esp_phy_disable(PHY_MODEM_BT);
-#ifdef CONFIG_PM_ENABLE
-        esp_pm_lock_release(s_pm_lock);
-#endif  // CONFIG_PM_ENABLE
+#ifdef CONFIG_PM
+        bt_pm_policy_state_lock_put();
+#endif  // CONFIG_PM
         s_ble_active = false;
     }
     ble_controller_status = ESP_BT_CONTROLLER_STATUS_INITED;
