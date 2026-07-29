@@ -1330,3 +1330,8 @@ uint8_t *esp_wifi_sta_get_ie(u8 *bssid, uint8_t elem_id)
 	ARG_UNUSED(elem_id);
 	return NULL;
 }
+
+bool current_task_is_wifi_task(void)
+{
+	return false;
+}
